@@ -6,6 +6,7 @@ import (
 	"encoding/csv"
 	"flag"
 	"fmt"
+	"github.com/datastream/skyline"
 	"image"
 	"image/color"
 	"image/png"
@@ -51,6 +52,8 @@ type tset struct {
 	window_long float64
 
 	min, max float64
+	ymax, yscale float64
+	xmax int
 }
 
 func (v *tset) add_mean(mean []float64, window, close_price float64) []float64 {
@@ -79,8 +82,67 @@ func (v *tset) add_price(close_price float64) {
 	}
 }
 
+func (v *tset) trend(start int, price []float64) (float64, float64, float64) {
+	num := len(price)
+
+	var points []skyline.TimePoint = make([]skyline.TimePoint, num, num)
+
+	for j := 0; j < num; j++ {
+		points[j].Timestamp = int64(start + j)
+		points[j].Value = price[j]
+	}
+
+	m, c := skyline.LinearRegressionLSE(points)
+
+	sum := 0.0
+	for _, val := range points {
+		projected := m*float64(val.Timestamp) + c
+		sum += math.Pow(val.Value-projected, 2)
+	}
+
+	return m, c, math.Sqrt(sum) / float64(num)
+}
+
+func (v *tset) scale(y float64) float64 {
+	return v.ymax - (y - v.min) * v.yscale
+}
+
+func (v *tset) draw_trend(gc draw2d.GraphicContext, start, stop int, m, c float64, color color.Color) {
+	gc.SetStrokeColor(color)
+
+	x0 := float64(start)
+	y0 := m * x0 + c
+	y0 = v.scale(y0)
+
+	x1 := float64(stop)
+	y1 := m * x1 + c
+	y1 = v.scale(y1)
+
+	gc.MoveTo(x0, y0)
+	gc.LineTo(x1, y1)
+	gc.Stroke()
+}
+
+func (v *tset) draw_grid(gc draw2d.GraphicContext) {
+	gc.SetStrokeColor(color.NRGBA{255, 0, 0, 100})
+	for i := 0; i < v.xmax; i += int(v.window_short) {
+		x := float64(i)
+		gc.MoveTo(x, 0)
+		gc.LineTo(x, v.ymax)
+		gc.Stroke()
+	}
+
+	gc.SetStrokeColor(color.NRGBA{120, 120, 0, 100})
+	for i := 0; i < v.xmax; i += int(v.window_long) {
+		x := float64(i)
+		gc.MoveTo(x, 0)
+		gc.LineTo(x, v.ymax)
+		gc.Stroke()
+	}
+}
+
 func (v *tset) draw(path string) {
-	img := image.NewRGBA(image.Rect(0, 0, len(v.price), 1000))
+	img := image.NewRGBA(image.Rect(0, 0, len(v.price), 2000))
 	gc := draw2d.NewGraphicContext(img)
 	gc.Clear()
 	gc.SetStrokeColor(image.Black)
@@ -89,44 +151,43 @@ func (v *tset) draw(path string) {
 	gc.SetLineCap(draw2d.ButtCap)
 	gc.FillStroke()
 
-	ymax := float64(img.Bounds().Max.Y)
-	scale := ymax / (v.max - v.min)
-	median := (v.max + v.min) / 2.0
+	v.ymax = float64(img.Bounds().Max.Y)
+	v.yscale = v.ymax / (v.max - v.min)
 
-	fmt.Printf("scale: %f, min: %f, max: %f\n", scale, v.min, v.max)
-	xmax := len(v.price)
-	if xmax > img.Bounds().Max.X {
-		xmax = img.Bounds().Max.X
+	fmt.Printf("scale: %f, min: %f, max: %f\n", v.yscale, v.min, v.max)
+	v.xmax = len(v.price)
+	if v.xmax > img.Bounds().Max.X {
+		v.xmax = img.Bounds().Max.X
 	}
 
-	gc.MoveTo(0, ymax)
-	for i := 0; i < xmax; i++ {
+	//v.draw_grid(gc)
+
+	gc.MoveTo(0, v.ymax)
+	for i := 0; i < v.xmax; i++ {
 		x := float64(i)
-		y := ymax - ((v.price[i]-v.min)*scale + median)
+		y := v.scale(v.price[i])
 
 		gc.LineTo(x, y)
 		gc.MoveTo(x, y)
 	}
 	gc.Stroke()
 
-	gc.MoveTo(0, ymax)
+	gc.MoveTo(0, v.ymax)
 	gc.SetStrokeColor(color.NRGBA{255, 0, 0, 255})
-	gc.FillStroke()
-	for i := 0; i < xmax; i++ {
+	for i := 0; i < v.xmax; i++ {
 		x := float64(i)
-		y := ymax - ((v.mean_short[i]-v.min)*scale + median)
+		y := v.scale(v.mean_short[i])
 
 		gc.LineTo(x, y)
 		gc.MoveTo(x, y)
 	}
 	gc.Stroke()
 
-	gc.MoveTo(0, ymax)
-	gc.SetStrokeColor(color.NRGBA{255, 255, 0, 255})
-	gc.FillStroke()
-	for i := 0; i < xmax; i++ {
+	gc.MoveTo(0, v.ymax)
+	gc.SetStrokeColor(color.NRGBA{120, 120, 0, 255})
+	for i := 0; i < v.xmax; i++ {
 		x := float64(i)
-		y := ymax - ((v.mean_long[i]-v.min)*scale + median)
+		y := v.scale(v.mean_long[i])
 
 		gc.LineTo(x, y)
 		gc.MoveTo(x, y)
@@ -135,14 +196,15 @@ func (v *tset) draw(path string) {
 
 	amount := 0.0
 	account := 1000.0
+	prev_account := 0.0
+
 	stop_loss := 0.0
+	profit_fix := 0.0
 
 	// transaction cost is 0.1%
 	trans_cost := 1.0 - 0.1/100.0
 
-	for i := 1; i < xmax; i++ {
-		x := float64(i)
-
+	for i := 1; i < v.xmax; i++ {
 		prev_mean_short := v.mean_short[i-1]
 		prev_mean_long := v.mean_long[i-1]
 
@@ -152,18 +214,44 @@ func (v *tset) draw(path string) {
 
 		buy := false
 		sell := false
-		if prev_mean_short < prev_mean_long && mean_short > mean_long {
+		if prev_mean_short < prev_mean_long && mean_short > mean_long && account != 0 {
 			buy = true
 		}
 		if prev_mean_short > prev_mean_long && mean_short < mean_long {
+			//sell = true
+		}
+
+		if price <= stop_loss && amount != 0 {
+			sell = true
+		}
+		if price > profit_fix && amount != 0 {
 			sell = true
 		}
 
-		if price <= stop_loss {
-			sell = true
-		}
+		x := float64(i)
+		y := v.scale(price)
 
-		y := ymax - ((price-v.min)*scale + median)
+		big_num := 25
+		num := 5
+		if i > big_num {
+			start := i - num
+			stop := i
+			//m, c, _ := v.trend(start, v.price[start : stop])
+
+			start = i - big_num
+			stop = i
+			ml, cl, stdl := v.trend(start, v.price[start : stop])
+
+			var op uint8 = 0
+			if stdl < 0.01 {
+				op = 255
+			}
+			v.draw_trend(gc, start, stop, ml, cl, color.NRGBA{0, 0, 255, op})
+			//v.draw_trend(gc, start, stop, ml, cl, color.NRGBA{0, 120, 255, op})
+
+			fmt.Printf("%d/%d: price: %f, m: %f, c: %f, std: %f\n", i, v.xmax, price, ml, cl, stdl)
+			//v.draw_trend(gc, start, stop, m, c, color.NRGBA{255, 0, 0, 100})
+		}
 
 		if buy {
 			if account != 0 {
@@ -172,29 +260,36 @@ func (v *tset) draw(path string) {
 				gc.ArcTo(x, y, 3.0, 3.0, 0, 2*math.Pi)
 				gc.Stroke()
 
+				fmt.Printf(" buy balance: %f\n", account)
 				amount = account * trans_cost / price
+				prev_account = account
 				account = 0
-				stop_loss = price * 0.9
+				stop_loss = price * 0.995
+				profit_fix = price * 1.02
 			}
 		}
 
 		if sell {
 			if amount != 0 {
-				gc.SetStrokeColor(color.NRGBA{0, 255, 0, 255})
-				gc.FillStroke()
 				gc.ArcTo(x, y, 3.0, 3.0, 0, 2*math.Pi)
-				gc.Stroke()
+				gc.SetStrokeColor(color.NRGBA{0, 255, 0, 255})
+				gc.SetFillColor(color.NRGBA{0, 255, 0, 255})
+
+				if price < stop_loss {
+					gc.FillStroke()
+				} else {
+					gc.Stroke()
+				}
 
 				account = amount * trans_cost * price
+				fmt.Printf("sell balance: %f %.2f%%\n", account, (account - prev_account) / prev_account * 100.0)
 				stop_loss = 0
 				amount = 0
 			}
-			fmt.Printf("balance: %f\n", account)
 		}
 	}
 	gc.Stroke()
 
-	gc.Fill()
 	saveToPngFile(path, img)
 }
 
@@ -217,7 +312,7 @@ func main() {
 
 	line := 0
 
-	v := &tset{window_short: 3, window_long: 17, min: 1000000000, max: 0}
+	v := &tset{window_short: 5, window_long: 20, min: 1000000000, max: 0}
 
 	for {
 		data, err := reader.Read()
